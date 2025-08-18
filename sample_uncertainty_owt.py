@@ -46,6 +46,97 @@ decode = lambda l: enc.decode(l)
 val_data = np.memmap('data/openwebtext/val.bin', dtype=np.uint16, mode='r')
 
 @torch.no_grad()
+def sample_with_sequence_uncertainty(model, start_text, max_new_tokens=50, temperature=0.8, n_samples=3):
+    """Sample multiple completions, fixing z for the entire sequence."""
+    model.eval()
+    start_ids = encode(start_text)
+    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+    
+    print(f"\n=== SEQUENCE-LEVEL UNCERTAINTY SAMPLING: '{start_text}' ===")
+    
+    for sample_idx in range(n_samples):
+        current_idx = x.clone()
+        
+        # difference: Sample the stochastic component ONCE per sequence.
+        # This represents picking one "function" from the distribution and using it throughout.
+        eps = torch.randn(1, 1, model.config.uncertainty_dim, device=device)
+        
+        for _ in range(max_new_tokens):
+            idx_cond = current_idx if current_idx.size(1) <= model.config.block_size else current_idx[:, -model.config.block_size:]
+            
+            # Forward through transformer
+            pos = torch.arange(0, idx_cond.size(1), dtype=torch.long, device=device)
+            tok_emb = model.transformer.wte(idx_cond)
+            pos_emb = model.transformer.wpe(pos)
+            x_hidden = model.transformer.drop(tok_emb + pos_emb)
+            for block in model.transformer.h:
+                x_hidden = block(x_hidden)
+            x_hidden = model.transformer.ln_f(x_hidden)
+            
+            # Get the deterministic part of the function representation
+            function_output = model.function_encoder(x_hidden[:, [-1], :])
+            mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+            
+            # Combine with the FIXED stochastic component
+            function_sample = mu + eps * log_sigma.exp()
+            logits = model.function_decoder_mean(function_sample)
+            
+            # Sample next token
+            logits = logits.squeeze(1) / temperature
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            current_idx = torch.cat((current_idx, idx_next), dim=1)
+        
+        print(f"\n--- Sample {sample_idx + 1} (fixed z) ---")
+        print(decode(current_idx[0].tolist()))
+        print("---")
+
+@torch.no_grad()
+def sample_with_z_resampling(model, start_text, max_new_tokens=50, temperature=0.8, resample_at_token=15):
+    """Generate a single sequence, but resample z at a specific token index."""
+    model.eval()
+    start_ids = encode(start_text)
+    current_idx = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+    
+    print(f"\n=== Z-RESAMPLING TEST: '{start_text}' ===")
+    print(f"Will generate with one 'z', then resample it at token {resample_at_token} and continue.")
+    
+    # Sample the initial stochastic component
+    eps = torch.randn(1, 1, model.config.uncertainty_dim, device=device)
+    
+    for token_idx in range(max_new_tokens):
+        # Check if it's time to resample z
+        if token_idx == resample_at_token:
+            print("\n--- Z RESAMPLED AT THIS POINT ---\n")
+            eps = torch.randn(1, 1, model.config.uncertainty_dim, device=device)
+
+        idx_cond = current_idx if current_idx.size(1) <= model.config.block_size else current_idx[:, -model.config.block_size:]
+        
+        # Forward through transformer
+        pos = torch.arange(0, idx_cond.size(1), dtype=torch.long, device=device)
+        tok_emb = model.transformer.wte(idx_cond)
+        pos_emb = model.transformer.wpe(pos)
+        x_hidden = model.transformer.drop(tok_emb + pos_emb)
+        for block in model.transformer.h:
+            x_hidden = block(x_hidden)
+        x_hidden = model.transformer.ln_f(x_hidden)
+        
+        # Get function representation
+        function_output = model.function_encoder(x_hidden[:, [-1], :])
+        mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+        function_sample = mu + eps * log_sigma.exp()
+        logits = model.function_decoder_mean(function_sample)
+        
+        # Sample next token
+        logits = logits.squeeze(1) / temperature
+        probs = F.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        current_idx = torch.cat((current_idx, idx_next), dim=1)
+    
+    print(decode(current_idx[0].tolist()))
+    print("---")
+    
+@torch.no_grad()
 def sample_with_uncertainty(model, start_text, max_new_tokens=50, temperature=0.8, n_samples=5):
     """Sample multiple completions to show uncertainty"""
     model.eval()
@@ -197,7 +288,7 @@ def measure_uncertainty_calibration(model, n_samples=100):
     
     if len(uncertainties) > 1:
         correlation = np.corrcoef(uncertainties, errors)[0, 1]
-        print(f"\n🎯 UNCERTAINTY-ERROR CORRELATION: {correlation:.3f}")
+        print(f"\n UNCERTAINTY-ERROR CORRELATION: {correlation:.3f}")
         print(f"Mean uncertainty: {np.mean(uncertainties):.4f}")
         print(f"Mean error: {np.mean(errors):.3f}")
         
@@ -205,15 +296,7 @@ def measure_uncertainty_calibration(model, n_samples=100):
         sorted_indices = np.argsort(uncertainties)
         print(f"\nLowest uncertainty: {uncertainties[sorted_indices[0]]:.4f}, error: {errors[sorted_indices[0]]:.3f}")
         print(f"Highest uncertainty: {uncertainties[sorted_indices[-1]]:.4f}, error: {errors[sorted_indices[-1]]:.3f}")
-        
-        # If correlation is good, celebrate!
-        if correlation > 0.3:
-            print("🚀 STRONG POSITIVE CORRELATION - This is breakthrough territory!")
-        elif correlation > 0.1:
-            print("✅ Positive correlation - Good progress!")
-        else:
-            print("⚠️  Weak/negative correlation - Needs work")
-            
+                    
     else:
         print("Not enough valid samples for correlation analysis")
 
@@ -355,6 +438,12 @@ if __name__ == "__main__":
     sample_with_uncertainty(model, "The capital of France is", max_new_tokens=30, n_samples=3)
     sample_with_uncertainty(model, "In my opinion,", max_new_tokens=30, n_samples=3)
     
+    sample_with_sequence_uncertainty(model, "The capital of France is", max_new_tokens=30, n_samples=3)
+    sample_with_sequence_uncertainty(model, "In my opinion", max_new_tokens=30, n_samples=3)
+    
+    resampling_prompt = "The board meeting was going well, until the CEO announced"
+    sample_with_z_resampling(model, resampling_prompt, max_new_tokens=40, resample_at_token=10)
+    
     # Analyze function space
     sample_contexts = [
         "In the field of science,",
@@ -367,7 +456,7 @@ if __name__ == "__main__":
     ]
     analyze_function_space(model, sample_contexts)
     
-    # Check uncertainty calibration (THE BIG TEST!)
+    # Check uncertainty calibration
     measure_uncertainty_calibration(model, n_samples=50)
     
     # Test predictable vs ambiguous
