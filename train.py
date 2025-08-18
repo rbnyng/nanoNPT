@@ -78,6 +78,16 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+def get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps):
+    if iter_num < kl_anneal_start:
+        return kl_weight_start
+    elif iter_num >= kl_anneal_start + kl_anneal_steps:
+        return kl_weight_end
+    else:
+        # Linear annealing
+        progress = (iter_num - kl_anneal_start) / kl_anneal_steps
+        return kl_weight_start + progress * (kl_weight_end - kl_weight_start)
+        
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -145,7 +155,9 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, 
+                  uncertainty_dim=uncertainty_dim, n_function_samples=n_function_samples,
+                  kl_weight=kl_weight_start) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -217,16 +229,29 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        total_losses = torch.zeros(eval_iters)
+        recon_losses = torch.zeros(eval_iters)
+        kl_losses = torch.zeros(eval_iters)
+        
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+                logits, recon_loss, kl_loss = model(X, Y)
+                current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+                total_loss = recon_loss + current_kl_weight * kl_loss
+                
+            total_losses[k] = total_loss.item()
+            recon_losses[k] = recon_loss.item() if recon_loss is not None else 0.0
+            kl_losses[k] = kl_loss.item() if kl_loss is not None else 0.0
+            
+        out[split] = {
+            'total': total_losses.mean(),
+            'recon': recon_losses.mean(), 
+            'kl': kl_losses.mean()
+        }
     model.train()
     return out
-
+    
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -262,17 +287,25 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+        
+        print(f"step {iter_num}: train loss {losses['train']['total']:.4f} (recon: {losses['train']['recon']:.4f}, kl: {losses['train']['kl']:.4f}), val loss {losses['val']['total']:.4f} (recon: {losses['val']['recon']:.4f}, kl: {losses['val']['kl']:.4f}), kl_weight: {current_kl_weight:.4f}", flush=True)
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/total_loss": losses['train']['total'],
+                "train/recon_loss": losses['train']['recon'],
+                "train/kl_loss": losses['train']['kl'],
+                "val/total_loss": losses['val']['total'],
+                "val/recon_loss": losses['val']['recon'], 
+                "val/kl_loss": losses['val']['kl'],
+                "kl_weight": current_kl_weight,
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu*100,
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if losses['val']['total'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']['total']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -282,7 +315,7 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
+                print(f"saving checkpoint to {out_dir}", flush=True)
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -297,8 +330,15 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            logits, recon_loss, kl_loss = model(X, Y)
+            
+            # Get current KL weight
+            current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+            
+            # Combine losses
+            loss = recon_loss + current_kl_weight * kl_loss
+            loss = loss / gradient_accumulation_steps  # scale the loss to account for gradient accumulation
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -321,10 +361,14 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        recon_lossf = recon_loss.item() if recon_loss is not None else 0.0
+        kl_lossf = kl_loss.item() if kl_loss is not None else 0.0
+        
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        
+        print(f"iter {iter_num}: loss {lossf:.4f} (recon: {recon_lossf:.4f}, kl: {kl_lossf:.4f}, kl_weight: {current_kl_weight:.4f}), time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%", flush=True)
     iter_num += 1
     local_iter_num += 1
 

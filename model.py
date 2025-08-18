@@ -114,7 +114,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
+    uncertainty_dim: int = 128  # dimension for function representation
+    n_function_samples: int = 5  # number of function samples during training
+    kl_weight: float = 1.0  # weight for KL term
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -130,12 +133,14 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.function_encoder = nn.Linear(config.n_embd, 2 * config.uncertainty_dim)
+        self.function_decoder_mean = nn.Linear(config.uncertainty_dim, config.vocab_size)
+        self.function_decoder_logvar = nn.Linear(config.uncertainty_dim, config.vocab_size)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -182,16 +187,28 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Training: sample functions and compute NP loss
+            function_output = self.function_encoder(x)  # (B, T, uncertainty_dim)
+            
+            mu, log_sigma = torch.chunk(function_output, 2, dim=-1)  
+            eps = torch.randn_like(mu)
+            function_sample = mu + eps * log_sigma.exp()
+
+            logits = self.function_decoder_mean(function_sample)
+            recon_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            # KL for latent
+            kl_loss = -0.5 * torch.mean(1 + 2*log_sigma - mu.pow(2) - (2*log_sigma).exp())
+
+            return logits, recon_loss, kl_loss
+            
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
-        return logits, loss
-
+            # Inference: just use mean
+            function_repr = self.function_encoder(x[:, [-1], :])
+            logits = self.function_decoder_mean(function_repr)
+            
+            return logits, None, None
+        
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
