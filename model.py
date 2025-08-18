@@ -203,12 +203,13 @@ class GPT(nn.Module):
             return logits, recon_loss, kl_loss
             
         else:
-            # Inference: just use mean
-            function_repr = self.function_encoder(x[:, [-1], :])
-            logits = self.function_decoder_mean(function_repr)
-            
+            # Inference: use the mean of the learned distribution
+            function_output = self.function_encoder(x[:, [-1], :]) # (B, 1, 2 * uncertainty_dim)
+            mu, _ = torch.chunk(function_output, 2, dim=-1) # We only need mu
+            logits = self.function_decoder_mean(mu) # Decode the mean representation
             return logits, None, None
-        
+
+          
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
@@ -330,7 +331,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
