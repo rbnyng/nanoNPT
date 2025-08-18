@@ -15,8 +15,8 @@ gradient_accumulation_steps = 4
 
 # Neural Process settings
 use_global_latent = True
-uncertainty_dim = 64
-context_aggregation = 'mean'
+uncertainty_dim = 128
+#context_aggregation = 'mean'
 free_bits = 0.1
 
 # Conservative regularization

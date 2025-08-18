@@ -109,7 +109,8 @@ class GPTConfig:
     # Neural Process parameters
     uncertainty_dim: int = 64  # Global latent dimension (much smaller)
     use_global_latent: bool = True  # Use global sequence-level latent
-    context_aggregation: str = 'mean'  # 'mean', 'last', 'attention'
+    context_aggregation: str = 'cls'  # 'mean', 'last', 'cls'
+    conditioning_method: str = 'film' # 'add' or 'film'
     free_bits: float = 0.1  # Minimum KL loss per latent dimension to prevent collapse
     
 class GPT(nn.Module):
@@ -119,11 +120,13 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
+        
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
+        
         # Standard transformer components
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size + 1, config.n_embd), # block_size + 1 for CLS
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -139,8 +142,11 @@ class GPT(nn.Module):
             )
             
             # Project latent back to embedding space for conditioning
-            self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
-            
+            if config.conditioning_method == 'film':
+                self.latent_to_film = nn.Linear(config.uncertainty_dim, 2 * config.n_embd)
+            else: # Default to 'add'
+                self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
+                
             # Optionally use attention for context aggregation
             if config.context_aggregation == 'attention':
                 self.context_attention = nn.MultiheadAttention(
@@ -192,30 +198,33 @@ class GPT(nn.Module):
         """Get transformer hidden states without final projection"""
         device = idx.device
         b, t = idx.size()
+        # we add 1 to t for the CLS token
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-
+        pos = torch.arange(0, t + 1, dtype=torch.long, device=device) # t + 1
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        # Prepend the CLS token to the sequence
+        cls_token_emb = self.cls_token.expand(b, -1, -1) # (b, 1, n_embd)
+        x = torch.cat((cls_token_emb, tok_emb), dim=1) # (b, t + 1, n_embd)
+        
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t + 1, n_embd)
+        x = self.transformer.drop(x + pos_emb)
+        
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        return x
-
+        return x # returns shape (b, t + 1, n_embd)
+        
     def aggregate_context(self, x):
         """Aggregate sequence into global context representation"""
         if self.config.context_aggregation == 'mean':
             return torch.mean(x, dim=1)  # (B, n_embd)
         elif self.config.context_aggregation == 'last':
             return x[:, -1, :]  # (B, n_embd)
-        elif self.config.context_aggregation == 'attention':
-            # Use attention to aggregate context
-            # Create learnable query
-            query = torch.mean(x, dim=1, keepdim=True)  # (B, 1, n_embd)
-            context, _ = self.context_attention(query, x, x)  # (B, 1, n_embd)
-            return context.squeeze(1)  # (B, n_embd)
+        elif self.config.context_aggregation == 'cls':
+            return x[:, 0, :] # Use the hidden state of the CLS token
         else:
             raise ValueError(f"Unknown context aggregation: {self.config.context_aggregation}")
 
@@ -246,19 +255,27 @@ class GPT(nn.Module):
         return kl_loss
 
     def forward(self, idx, targets=None):
-        # Get transformer hidden states
-        x = self.get_transformer_hidden(idx)  # (B, T, n_embd)
-
+        # Get transformer hidden states (includes CLS token at position 0)
+        hidden_states_with_cls = self.get_transformer_hidden(idx) # (B, T + 1, n_embd)
+        
         if self.config.use_global_latent:
             if targets is not None:
                 # Training: sample from global latent distribution
-                global_context = self.aggregate_context(x)  # (B, n_embd)
+                global_context = self.aggregate_context(hidden_states_with_cls)  # (B, n_embd)
                 z, mu, log_sigma = self.sample_global_latent(global_context, sample=True)
                 
-                # Condition transformer output with global latent
-                z_emb = self.latent_to_emb(z).unsqueeze(1)   # (B, 1, n_embd)
-                x_conditioned = x + z_emb  # Broadcast to all positions: (B, T, n_embd)
+                # Strip the CLS token before conditioning and final projection
+                x = hidden_states_with_cls[:, 1:, :] # (B, T, n_embd)
                 
+                # Condition transformer output with global latent
+                if self.config.conditioning_method == 'film':
+                    film_params = self.latent_to_film(z).unsqueeze(1) # (B, 1, 2 * n_embd)
+                    gamma, beta = film_params.chunk(2, dim=-1) # Each is (B, 1, n_embd)
+                    x_conditioned = gamma * x + beta # Apply FiLM
+                else: # Default to 'add'
+                    z_emb = self.latent_to_emb(z).unsqueeze(1)
+                    x_conditioned = x + z_emb
+                    
                 # Standard language modeling
                 logits = self.lm_head(x_conditioned)
                 
@@ -269,8 +286,11 @@ class GPT(nn.Module):
                 return logits, recon_loss, kl_loss
             else:
                 # Inference: use mean latent (deterministic)
-                global_context = self.aggregate_context(x)
+                global_context = self.aggregate_context(hidden_states_with_cls)
                 z, _, _ = self.sample_global_latent(global_context, sample=False)
+                
+                # Strip the CLS token
+                x = hidden_states_with_cls[:, 1:, :] # (B, T, n_embd)
                 
                 z_emb = self.latent_to_emb(z).unsqueeze(1)
                 x_conditioned = x + z_emb
@@ -322,8 +342,13 @@ class GPT(nn.Module):
                 
                 if self.config.use_global_latent:
                     # Use the fixed global latent for entire sequence
-                    z_emb = self.latent_to_emb(z_fixed).unsqueeze(1)
-                    x_conditioned = x + z_emb
+                    if hasattr(self.config, 'conditioning_method') and self.config.conditioning_method == 'film':
+                        film_params = self.latent_to_film(z_fixed).unsqueeze(1)
+                        gamma, beta = film_params.chunk(2, dim=-1)
+                        x_conditioned = gamma * x + beta
+                    else: # Default to 'add'
+                        z_emb = self.latent_to_emb(z_fixed).unsqueeze(1)
+                        x_conditioned = x + z_emb                    
                     logits = self.lm_head(x_conditioned)
                 else:
                     # Fallback per-token sampling

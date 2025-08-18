@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
 from model import GPTConfig, GPT
+from uncertainty_utils import analyze_prompt_uncertainty, sample_with_uncertainty, compare_latent_effects
 
 # Configuration
 out_dir = 'out-np-shakespeare'
@@ -112,139 +113,6 @@ INCOMPLETE_PHRASES = [
 ]
 
 @torch.no_grad()
-def analyze_prompt_uncertainty(model, prompt, n_samples=30, verbose=False):
-    try:
-        ids = encode(prompt)
-        if len(ids) == 0:
-            return None
-        
-        x = torch.tensor([ids], dtype=torch.long, device=device)
-        
-        # Get transformer hidden states
-        x_hidden = model.get_transformer_hidden(x)
-        global_context = model.aggregate_context(x_hidden)
-        
-        # Sample multiple global latents and see their effects
-        sample_logits = []
-        sample_entropies = []
-        
-        for _ in range(n_samples):
-            # Sample a different global latent each time
-            z, mu, log_sigma = model.sample_global_latent(global_context, sample=True)
-            
-            # Apply this specific latent
-            z_emb = model.latent_to_emb(z).unsqueeze(1)
-            x_conditioned = x_hidden + z_emb
-            logits = model.lm_head(x_conditioned)
-            
-            # Get last token prediction
-            last_logits = logits[0, -1, :].float()
-            probs = F.softmax(last_logits, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8))
-            
-            sample_logits.append(last_logits.cpu().numpy())
-            sample_entropies.append(entropy.item())
-        
-        # Calculate uncertainty metrics
-        logits_array = np.array(sample_logits)
-        mean_logits = np.mean(logits_array, axis=0)
-        var_logits = np.var(logits_array, axis=0)
-        
-        # Overall metrics
-        total_variance = np.mean(var_logits)
-        mean_entropy = np.mean(sample_entropies)
-        std_entropy = np.std(sample_entropies)
-        
-        # Top predicted characters
-        mean_probs = F.softmax(torch.tensor(mean_logits).float(), dim=-1).numpy()
-        top_indices = np.argsort(mean_probs)[-5:][::-1]
-        
-        if verbose:
-            print(f"\n--- Analyzing: '{prompt}' ---")
-            print(f"Logit variance: {total_variance:.6f}")
-            print(f"Entropy: {mean_entropy:.3f} ± {std_entropy:.3f}")
-            print("Top predictions:")
-            for i, idx in enumerate(top_indices):
-                char = itos[idx] if idx < len(itos) else f"UNK_{idx}"
-                prob = mean_probs[idx]
-                var_prob = var_logits[idx]
-                print(f"  {i+1}. '{char}' → prob: {prob:.3f}, var: {var_prob:.6f}")
-        
-        return {
-            'prompt': prompt,
-            'logit_variance': total_variance,
-            'entropy_mean': mean_entropy,
-            'entropy_std': std_entropy,
-            'top_chars': [(itos[idx], mean_probs[idx], var_logits[idx]) for idx in top_indices],
-            'n_samples': n_samples
-        }
-        
-    except Exception as e:
-        print(f"Error analyzing '{prompt}': {e}")
-        return None
-
-@torch.no_grad()
-def sample_with_uncertainty(model, prompt, max_new_tokens=50, n_samples=5, temperature=0.8):
-    print(f"\n=== UNCERTAINTY SAMPLING: '{prompt}' ===")
-    
-    try:
-        ids = encode(prompt)
-        if len(ids) == 0:
-            print("Empty prompt!")
-            return
-        
-        samples = model.generate_with_uncertainty(
-            torch.tensor([ids], dtype=torch.long, device=device),
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            n_samples=n_samples
-        )
-        
-        for i, sample in enumerate(samples):
-            sample_text = decode(sample[0].tolist())
-            print(f"\n--- Sample {i+1} ---")
-            print(sample_text)
-            print("---")
-            
-    except Exception as e:
-        print(f"Error sampling '{prompt}': {e}")
-
-@torch.no_grad()
-def compare_latent_effects(model, prompt, n_samples=3, max_tokens=30):
-    print(f"\n=== GLOBAL LATENT COMPARISON: '{prompt}' ===")
-    
-    try:
-        ids = encode(prompt)
-        x = torch.tensor([ids], dtype=torch.long, device=device)
-        
-        # Generate with different global latents
-        for i in range(n_samples):
-            # Get fresh global latent by doing a forward pass
-            x_hidden = model.get_transformer_hidden(x)
-            global_context = model.aggregate_context(x_hidden)
-            z, _, _ = model.sample_global_latent(global_context, sample=True)
-            
-            # Generate with this fixed latent
-            current_tokens = x.clone()
-            for _ in range(max_tokens):
-                if current_tokens.size(1) > model.config.block_size:
-                    current_tokens = current_tokens[:, -model.config.block_size:]
-                
-                x_hidden = model.get_transformer_hidden(current_tokens)
-                z_emb = model.latent_to_emb(z).unsqueeze(1)
-                x_conditioned = x_hidden + z_emb
-                logits = model.lm_head(x_conditioned)
-                
-                probs = F.softmax(logits[:, -1, :] / 0.8, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                current_tokens = torch.cat([current_tokens, next_token], dim=1)
-            
-            print(f"\nLatent {i+1}: {decode(current_tokens[0].tolist())}")
-            
-    except Exception as e:
-        print(f"Error in latent comparison '{prompt}': {e}")
-
-@torch.no_grad()
 def analyze_character_uncertainty():
     print("\n" + "="*70)
     print("CHARACTER UNCERTAINTY ANALYSIS")
@@ -252,7 +120,7 @@ def analyze_character_uncertainty():
     
     results = []
     for char in CHARACTER_NAMES:
-        result = analyze_prompt_uncertainty(model, char, n_samples=20, verbose=False)
+        result = analyze_prompt_uncertainty(model, char, encode, decode, n_samples=20, verbose=False)
         if result:
             results.append(result)
             print(f"{char:15s} → Uncertainty: {result['logit_variance']:.6f}, Entropy: {result['entropy_mean']:.3f}")
@@ -275,13 +143,13 @@ def analyze_famous_quotes():
     
     results = []
     for quote in FAMOUS_QUOTES:
-        result = analyze_prompt_uncertainty(model, quote, n_samples=20, verbose=False)
+        result = analyze_prompt_uncertainty(model, quote, encode, decode, n_samples=20, verbose=False)
         if result:
             results.append(result)
             print(f"'{quote}' → Uncertainty: {result['logit_variance']:.6f}")
             # Show top prediction
-            if result['top_chars']:
-                top_char, top_prob, _ = result['top_chars'][0]
+            if result['top_tokens']:
+                top_char, top_prob, _ = result['top_tokens'][0]
                 print(f"  Top prediction: '{top_char}' (prob: {top_prob:.3f})")
     
     return results
@@ -294,7 +162,7 @@ def analyze_stage_directions():
     
     results = []
     for stage in STAGE_DIRECTIONS:
-        result = analyze_prompt_uncertainty(model, stage, n_samples=20, verbose=False)
+        result = analyze_prompt_uncertainty(model, stage, encode, decode, n_samples=20, verbose=False)
         if result:
             results.append(result)
             print(f"'{stage}' → Uncertainty: {result['logit_variance']:.6f}")
@@ -327,7 +195,7 @@ def comprehensive_uncertainty_test():
     for category, prompts in categories:
         print(f"\n--- {category.upper().replace('_', ' ')} ---")
         for prompt in prompts:
-            result = analyze_prompt_uncertainty(model, prompt, n_samples=15, verbose=False)
+            result = analyze_prompt_uncertainty(model, prompt, encode, decode, n_samples=15, verbose=False)
             if result:
                 all_results[category].append(result)
                 print(f"'{prompt:20s}' → {result['logit_variance']:.6f}")
@@ -346,16 +214,16 @@ if __name__ == "__main__":
     print("="*70)
     
     # Quick examples first
-    sample_with_uncertainty(model, "ROMEO:", max_new_tokens=40, n_samples=3)
-    sample_with_uncertainty(model, "To be or not to ", max_new_tokens=30, n_samples=3)
+    sample_with_uncertainty(model, "ROMEO:", encode, decode, max_new_tokens=40, n_samples=3)
+    sample_with_uncertainty(model, "To be or not to ", encode, decode, max_new_tokens=30, n_samples=3)
     
     # Global latent comparison
-    compare_latent_effects(model, "JULIET:", n_samples=4, max_tokens=25)
+    compare_latent_effects(model, "JULIET:", encode, decode, n_samples=4, max_tokens=25)
     
     # Detailed analysis
-    analyze_prompt_uncertainty(model, "ROMEO:", n_samples=30, verbose=True)
-    analyze_prompt_uncertainty(model, "To be or not to ", n_samples=30, verbose=True)
-    analyze_prompt_uncertainty(model, "Enter ", n_samples=30, verbose=True)
+    analyze_prompt_uncertainty(model, "ROMEO:", encode, decode, n_samples=30, verbose=True)
+    analyze_prompt_uncertainty(model, "To be or not to ", encode, decode, n_samples=30, verbose=True)
+    analyze_prompt_uncertainty(model, "Enter ", encode, decode, n_samples=30, verbose=True)
     
     # Character analysis
     char_results = analyze_character_uncertainty()
