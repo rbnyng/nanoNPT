@@ -1,13 +1,24 @@
 
-# nanoGPT
+# nanoNPT
 
 ![nanoGPT](assets/nanogpt.jpg)
 
-The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
+This repository is a fork of Andrej Karpathy's `nanoGPT`, extending it into a Neural Process Transformer (NPT. It transforms the deterministic GPT into a principled probabilistic mode that can quantify its own uncertainty.
 
-![repro124m](assets/gpt2_124M_loss.png)
+While the original `nanoGPT` predicts the next token, `nanoNPT` learns a distribution over prediction functions. This allows it to:
+1.  Measure its own confidence.
+2.  Generate diverse samples from the same context, exploring different modes of possibility.
+3.  Serve as a research platform for interpretability and controllable generation via a structured latent space.
 
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
+A standard GPT learns a mapping from a context to a single prediction (a set of logits). This model learns a mapping from a context to the parameters of a distribution in a latent function space.
+
+During generation, we sample a vector `z` from this space, which represents a single prediction function. By sampling multiple `z` vectors, we can explore the model's uncertainty about which function is appropriate for a given context.
+
+The core implementation remains simple and readable, adhering to the spirit of `nanoGPT`. The primary changes are in `model.py` and `train.py`. We also provide new scripts for analyzing the model's uncertainty.
+
+This model is a research prototype. For the original educational `nanoGPT`, please see the [original repository](https://github.com/karpathy/nanoGPT).
+
+The rest of the readme is the same as from nanoGPT.
 
 ## install
 
