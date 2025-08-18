@@ -1,12 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
 import inspect
 from dataclasses import dataclass
@@ -114,9 +105,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    uncertainty_dim: int = 128  # dimension for function representation
-    n_function_samples: int = 5  # number of function samples during training
-    kl_weight: float = 1.0  # weight for KL term
+    
+    # Neural Process parameters
+    uncertainty_dim: int = 64  # Global latent dimension (much smaller)
+    use_global_latent: bool = True  # Use global sequence-level latent
+    context_aggregation: str = 'mean'  # 'mean', 'last', 'attention'
+    free_bits: float = 0.1  # Minimum KL loss per latent dimension to prevent collapse
     
 class GPT(nn.Module):
 
@@ -126,6 +120,7 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # Standard transformer components
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -133,8 +128,35 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.function_encoder = nn.Linear(config.n_embd, 2 * config.uncertainty_dim)
-        self.function_decoder_mean = nn.Linear(config.uncertainty_dim, config.vocab_size)
+        
+        # Neural Process components
+        if config.use_global_latent:
+            # Global context encoder: sequence -> global latent distribution
+            self.global_context_encoder = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd // 2),
+                nn.ReLU(),
+                nn.Linear(config.n_embd // 2, 2 * config.uncertainty_dim)
+            )
+            
+            # Project latent back to embedding space for conditioning
+            self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
+            
+            # Optionally use attention for context aggregation
+            if config.context_aggregation == 'attention':
+                self.context_attention = nn.MultiheadAttention(
+                    config.n_embd, num_heads=config.n_head, 
+                    dropout=config.dropout, batch_first=True
+                )
+        else:
+            # Fallback to old per-token system (for comparison)
+            self.function_encoder = nn.Linear(config.n_embd, 2 * config.uncertainty_dim)
+            self.function_decoder_mean = nn.Linear(config.uncertainty_dim, config.vocab_size)
+
+        # Standard language modeling head (tied weights)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Weight tying (following GPT-2)
+        self.lm_head.weight = self.transformer.wte.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -166,11 +188,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def get_transformer_hidden(self, idx):
+        """Get transformer hidden states without final projection"""
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -179,98 +202,163 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+        return x
 
-        if targets is not None:
-            # Training: sample functions and compute NP loss
-            function_output = self.function_encoder(x)  # (B, T, uncertainty_dim)
-            
-            mu, log_sigma = torch.chunk(function_output, 2, dim=-1)  
-            eps = torch.randn_like(mu)
-            function_sample = mu + eps * log_sigma.exp()
-
-            logits = self.function_decoder_mean(function_sample)
-            recon_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-            # KL for latent
-            kl_loss = -0.5 * torch.mean(1 + 2*log_sigma - mu.pow(2) - (2*log_sigma).exp())
-
-            return logits, recon_loss, kl_loss
-            
+    def aggregate_context(self, x):
+        """Aggregate sequence into global context representation"""
+        if self.config.context_aggregation == 'mean':
+            return torch.mean(x, dim=1)  # (B, n_embd)
+        elif self.config.context_aggregation == 'last':
+            return x[:, -1, :]  # (B, n_embd)
+        elif self.config.context_aggregation == 'attention':
+            # Use attention to aggregate context
+            # Create learnable query
+            query = torch.mean(x, dim=1, keepdim=True)  # (B, 1, n_embd)
+            context, _ = self.context_attention(query, x, x)  # (B, 1, n_embd)
+            return context.squeeze(1)  # (B, n_embd)
         else:
-            # Inference: use the mean of the learned distribution
-            function_output = self.function_encoder(x[:, [-1], :]) # (B, 1, 2 * uncertainty_dim)
-            mu, _ = torch.chunk(function_output, 2, dim=-1) # We only need mu
-            logits = self.function_decoder_mean(mu) # Decode the mean representation
-            return logits, None, None
+            raise ValueError(f"Unknown context aggregation: {self.config.context_aggregation}")
 
-          
+    def sample_global_latent(self, context, sample=True):
+        """Sample from global latent distribution"""
+        latent_params = self.global_context_encoder(context)  # (B, 2*uncertainty_dim)
+        mu, log_sigma = latent_params.chunk(2, dim=-1)  # Each (B, uncertainty_dim)
+        
+        if sample:
+            eps = torch.randn_like(mu)
+            z = mu + eps * log_sigma.exp()
+        else:
+            z = mu  # Use mean for deterministic inference
+            
+        return z, mu, log_sigma
+
+    def compute_kl_loss(self, mu, log_sigma):
+        """Compute KL divergence with free bits"""
+        # Standard VAE KL: KL(q(z|x) || p(z)) where p(z) = N(0,I)
+        kl_per_dim = -0.5 * (1 + 2*log_sigma - mu.pow(2) - (2*log_sigma).exp())  # (B, latent_dim)
+        
+        # Apply free bits: don't let KL go below threshold per dimension
+        if self.config.free_bits > 0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=self.config.free_bits)
+        
+        # Sum over latent dimensions, mean over batch
+        kl_loss = torch.sum(kl_per_dim, dim=-1).mean()  # Scalar
+        return kl_loss
+
+    def forward(self, idx, targets=None):
+        # Get transformer hidden states
+        x = self.get_transformer_hidden(idx)  # (B, T, n_embd)
+
+        if self.config.use_global_latent:
+            if targets is not None:
+                # Training: sample from global latent distribution
+                global_context = self.aggregate_context(x)  # (B, n_embd)
+                z, mu, log_sigma = self.sample_global_latent(global_context, sample=True)
+                
+                # Condition transformer output with global latent
+                z_emb = self.latent_to_emb(z).unsqueeze(1)   # (B, 1, n_embd)
+                x_conditioned = x + z_emb  # Broadcast to all positions: (B, T, n_embd)
+                
+                # Standard language modeling
+                logits = self.lm_head(x_conditioned)
+                
+                # Compute losses
+                recon_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+                kl_loss = self.compute_kl_loss(mu, log_sigma)
+                
+                return logits, recon_loss, kl_loss
+            else:
+                # Inference: use mean latent (deterministic)
+                global_context = self.aggregate_context(x)
+                z, _, _ = self.sample_global_latent(global_context, sample=False)
+                
+                z_emb = self.latent_to_emb(z).unsqueeze(1)
+                x_conditioned = x + z_emb
+                logits = self.lm_head(x_conditioned)
+                
+                return logits, None, None
+        else:
+            # Fallback to old per-token system for comparison
+            if targets is not None:
+                function_output = self.function_encoder(x)
+                mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+                eps = torch.randn_like(mu)
+                function_sample = mu + eps * log_sigma.exp()
+                logits = self.function_decoder_mean(function_sample)
+                
+                recon_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+                kl_loss = self.compute_kl_loss(mu.view(-1, mu.size(-1)), log_sigma.view(-1, log_sigma.size(-1)))
+                
+                return logits, recon_loss, kl_loss
+            else:
+                function_output = self.function_encoder(x[:, [-1], :])
+                mu, _ = torch.chunk(function_output, 2, dim=-1)
+                logits = self.function_decoder_mean(mu)
+                return logits, None, None
+
+    @torch.no_grad()
+    def generate_with_uncertainty(self, idx, max_new_tokens, temperature=1.0, top_k=None, n_samples=1):
+        """
+        Generate with uncertainty sampling using different global latents per sample
+        """
+        samples = []
+        
+        for _ in range(n_samples):
+            current_idx = idx.clone()
+            
+            # Sample a global latent once for this entire sequence
+            if self.config.use_global_latent:
+                # Get initial context and sample latent
+                x_init = self.get_transformer_hidden(current_idx)
+                global_context = self.aggregate_context(x_init)
+                z_fixed, _, _ = self.sample_global_latent(global_context, sample=True)
+            
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = current_idx if current_idx.size(1) <= self.config.block_size else current_idx[:, -self.config.block_size:]
+                
+                # forward the model to get the logits for the index in the sequence
+                x = self.get_transformer_hidden(idx_cond)
+                
+                if self.config.use_global_latent:
+                    # Use the fixed global latent for entire sequence
+                    z_emb = self.latent_to_emb(z_fixed).unsqueeze(1)
+                    x_conditioned = x + z_emb
+                    logits = self.lm_head(x_conditioned)
+                else:
+                    # Fallback per-token sampling
+                    function_output = self.function_encoder(x[:, [-1], :])
+                    mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+                    eps = torch.randn_like(mu)
+                    function_sample = mu + eps * log_sigma.exp()
+                    logits = self.function_decoder_mean(function_sample)
+                
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                current_idx = torch.cat((current_idx, idx_next), dim=1)
+
+            samples.append(current_idx)
+        
+        return samples
+
+    # Keep all the other methods from original (crop_block_size, from_pretrained, etc.)
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -295,7 +383,6 @@ class GPT(nn.Module):
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
-
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
@@ -317,9 +404,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Standard generation (uses mean latent if global, or deterministic if per-token)
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
@@ -338,5 +423,4 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
         return idx

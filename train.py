@@ -1,21 +1,3 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
 import os
 import time
 import math
@@ -30,48 +12,58 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
+# default config values designed to work with new architecture
 # I/O
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+eval_only = False
+always_save_checkpoint = True
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = False
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2'
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5 * 8
+batch_size = 12
 block_size = 1024
 # model
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+dropout = 0.0
+bias = False
+# Neural Process parameters (new)
+use_global_latent = True
+uncertainty_dim = 64
+context_aggregation = 'mean'
+free_bits = 0.1
+# KL annealing parameters
+kl_weight_start = 0.0
+kl_weight_end = 0.1
+kl_anneal_steps = 10000
+kl_anneal_start = 1000
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+learning_rate = 6e-4
+max_iters = 600000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 1.0
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+decay_lr = True
+warmup_iters = 2000
+lr_decay_iters = 600000
+min_lr = 6e-5
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+backend = 'nccl'
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+device = 'cuda'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = True
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -79,6 +71,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 def get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps):
+    """Get current KL weight based on annealing schedule"""
     if iter_num < kl_anneal_start:
         return kl_weight_start
     elif iter_num >= kl_anneal_start + kl_anneal_steps:
@@ -109,7 +102,7 @@ else:
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+print(f"tokens per iteration will be: {tokens_per_iter:,}", flush=True)
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -151,13 +144,24 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})", flush=True)
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, 
-                  uncertainty_dim=uncertainty_dim, n_function_samples=n_function_samples,
-                  kl_weight=kl_weight_start) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer, 
+    n_head=n_head, 
+    n_embd=n_embd, 
+    block_size=block_size,
+    bias=bias, 
+    vocab_size=None, 
+    dropout=dropout,
+    # Neural Process parameters
+    use_global_latent=use_global_latent,
+    uncertainty_dim=uncertainty_dim,
+    context_aggregation=context_aggregation,
+    free_bits=free_bits
+)
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -192,12 +196,10 @@ elif init_from == 'resume':
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+    # Note: GPT-2 initialization won't work with Neural Process extensions
+    # This would need custom logic to initialize only the transformer parts
+    raise NotImplementedError("GPT-2 initialization not yet supported with Neural Process extensions")
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -277,6 +279,12 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+print("Starting training...", flush=True)
+print(f"Neural Process mode: use_global_latent={use_global_latent}", flush=True)
+print(f"Uncertainty dim: {uncertainty_dim}", flush=True)
+print(f"KL annealing: {kl_weight_start} -> {kl_weight_end} over {kl_anneal_steps} steps starting at {kl_anneal_start}", flush=True)
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -289,7 +297,7 @@ while True:
         losses = estimate_loss()
         current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
         
-        print(f"step {iter_num}: train loss {losses['train']['total']:.4f} (recon: {losses['train']['recon']:.4f}, kl: {losses['train']['kl']:.4f}), val loss {losses['val']['total']:.4f} (recon: {losses['val']['recon']:.4f}, kl: {losses['val']['kl']:.4f}), kl_weight: {current_kl_weight:.4f}", flush=True)
+        print(f"step {iter_num}: train loss {losses['train']['total']:.4f} (recon: {losses['train']['recon']:.4f}, kl: {losses['train']['kl']:.4f}), val loss {losses['val']['total']:.4f} (recon: {losses['val']['recon']:.4f}, kl: {losses['val']['kl']:.4f}), kl_weight: {current_kl_weight:.6f}", flush=True)
         
         if wandb_log:
             wandb.log({
@@ -368,7 +376,7 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
-        print(f"iter {iter_num}: loss {lossf:.4f} (recon: {recon_lossf:.4f}, kl: {kl_lossf:.4f}, kl_weight: {current_kl_weight:.4f}), time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%", flush=True)
+        print(f"iter {iter_num}: loss {lossf:.4f} (recon: {recon_lossf:.4f}, kl: {kl_lossf:.4f}, kl_weight: {current_kl_weight:.6f}), time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%", flush=True)
     iter_num += 1
     local_iter_num += 1
 

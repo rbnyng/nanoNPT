@@ -19,7 +19,7 @@ n_embd = 512
 dropout = 0.1
 
 # NP parameters
-uncertainty_dim = 256  # Larger for more expressiveness
+uncertainty_dim = 256
 n_function_samples = 5
 # KL annealing parameters
 kl_weight_start = 0.0        # Start with no KL loss
