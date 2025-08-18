@@ -1,7 +1,3 @@
-"""
-Uncertainty Analysis for Neural Process GPT trained on OpenWebText
-Designed for BPE tokenized model with global latents
-"""
 import os
 import pickle
 import numpy as np
@@ -122,7 +118,6 @@ LONG_CONTEXTS = [
 
 @torch.no_grad()
 def analyze_prompt_uncertainty(model, prompt, n_samples=30, verbose=False):
-    """Analyze uncertainty for a single prompt using proper global latent sampling"""
     try:
         ids = encode(prompt)
         if len(ids) == 0:
@@ -200,7 +195,6 @@ def analyze_prompt_uncertainty(model, prompt, n_samples=30, verbose=False):
 
 @torch.no_grad()
 def sample_with_uncertainty(model, prompt, max_new_tokens=50, n_samples=5, temperature=0.8):
-    """Generate multiple samples showing uncertainty"""
     print(f"\n=== UNCERTAINTY SAMPLING: '{prompt}' ===")
     
     try:
@@ -230,7 +224,6 @@ def sample_with_uncertainty(model, prompt, max_new_tokens=50, n_samples=5, tempe
 
 @torch.no_grad()
 def compare_global_latents(model, prompt, n_samples=4, max_tokens=30):
-    """Show how different global latents affect the same prompt"""
     print(f"\n=== GLOBAL LATENT COMPARISON: '{prompt}' ===")
     
     try:
@@ -269,7 +262,6 @@ def compare_global_latents(model, prompt, n_samples=4, max_tokens=30):
 
 @torch.no_grad()
 def run_category_analysis():
-    """Run analysis across different prompt categories"""
     print("\n" + "="*80)
     print("CATEGORICAL UNCERTAINTY ANALYSIS")
     print("="*80)
@@ -313,7 +305,6 @@ def run_category_analysis():
 
 @torch.no_grad()
 def test_context_length_effects():
-    """Test how uncertainty changes with context length"""
     print(f"\n=== CONTEXT LENGTH EFFECTS ===")
     
     base_text = "The quick brown fox jumps over the lazy dog and then runs through the forest"
@@ -339,7 +330,6 @@ def test_context_length_effects():
 
 @torch.no_grad()
 def test_calibration_on_validation_data(n_samples=50):
-    """Test uncertainty calibration using validation data"""
     print(f"\n=== VALIDATION DATA CALIBRATION ===")
     
     uncertainties = []
@@ -439,30 +429,18 @@ if __name__ == "__main__":
     uncertainties, errors = test_calibration_on_validation_data(n_samples=30)
     
     print("\n" + "="*80)
-    print("ANALYSIS COMPLETE!")
+    print("ANALYSIS COMPLETE")
     print("="*80)
     
     # Final summary
     if category_results:
-        print("\nKey Findings:")
+        print("\nFindings:")
         factual_unc = category_results.get("Factual Statements", {}).get('mean', 0)
         opinion_unc = category_results.get("Opinion Starters", {}).get('mean', 0)
         
         if factual_unc > 0 and opinion_unc > 0:
             ratio = opinion_unc / factual_unc
             print(f"Opinion/Factual uncertainty ratio: {ratio:.2f}")
-            if ratio > 1.2:
-                print("✅ Model shows higher uncertainty for subjective contexts!")
-            elif ratio < 0.8:
-                print("⚠️ Model shows higher uncertainty for factual contexts")
-            else:
-                print("📊 Uncertainty levels are similar across context types")
         
         if uncertainties and errors:
             correlation = np.corrcoef(uncertainties, errors)[0, 1]
-            if correlation > 0.2:
-                print("✅ Positive correlation: Higher uncertainty → Higher error")
-            elif correlation < -0.2:
-                print("🤔 Negative correlation: Higher uncertainty → Lower error")
-            else:
-                print("📊 No clear correlation between uncertainty and error")
