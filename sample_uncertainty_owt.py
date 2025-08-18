@@ -162,9 +162,10 @@ def sample_with_uncertainty(model, start_text, max_new_tokens=50, temperature=0.
             x_hidden = model.transformer.ln_f(x_hidden)
             
             # Sample from function distribution
-            function_repr = model.function_encoder(x_hidden[:, [-1], :])
-            eps = torch.randn_like(function_repr) * 0.5
-            function_sample = function_repr + eps
+            function_output = model.function_encoder(x_hidden[:, [-1], :])
+            mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+            eps = torch.randn_like(mu) * 0.5
+            function_sample = mu + eps * log_sigma.exp()
             logits = model.function_decoder_mean(function_sample)
             
             # Sample next token
@@ -207,7 +208,7 @@ def analyze_function_space(model, sample_contexts):
             hidden = model.transformer.ln_f(hidden)
             
             # Get function representation
-            func_repr = model.function_encoder(hidden[:, -1, :])
+            func_repr = model.function_encoder(hidden[:, [-1], :])  
             function_reprs.append(func_repr.cpu().numpy())
             valid_contexts.append(context)
             
@@ -261,11 +262,13 @@ def measure_uncertainty_calibration(model, n_samples=100):
             # Sample multiple functions
             predictions = []
             for _ in range(20):  # More samples for better uncertainty estimate
-                eps = torch.randn(1, model.config.uncertainty_dim, device=device) * 0.5
-                func_repr = model.function_encoder(hidden[:, [-1], :]) + eps
+                function_output = model.function_encoder(hidden[:, [-1], :])
+                mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+                eps = torch.randn_like(mu) * 0.5
+                func_repr = mu + eps * log_sigma.exp()
                 logits = model.function_decoder_mean(func_repr)
                 predictions.append(logits)
-            
+    
             # Calculate uncertainty as variance
             logits_stack = torch.stack(predictions)
             uncertainty = torch.var(logits_stack, dim=0).mean().item()
@@ -341,11 +344,13 @@ def test_predictable_vs_ambiguous(model):
             # Sample multiple functions
             predictions = []
             for _ in range(30):  # More samples for OpenWebText
-                eps = torch.randn(1, model.config.uncertainty_dim, device=device) * 0.5
-                func_repr = model.function_encoder(hidden[:, [-1], :]) + eps
+                function_output = model.function_encoder(hidden[:, [-1], :])
+                mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+                eps = torch.randn_like(mu) * 0.5
+                func_repr = mu + eps * log_sigma.exp()
                 logits = model.function_decoder_mean(func_repr)
-                predictions.append(logits)
-            
+                predictions.append(logits)     
+                
             # Calculate uncertainty as variance
             logits_stack = torch.stack(predictions)
             uncertainty = torch.var(logits_stack, dim=0).mean().item()
@@ -409,12 +414,14 @@ def analyze_next_token_predictions(model, context_text, n_samples=20):
     # Collect predictions from different function samples
     all_predictions = []
     for _ in range(n_samples):
-        eps = torch.randn(1, model.config.uncertainty_dim, device=device) * 0.5
-        func_repr = model.function_encoder(hidden[:, [-1], :]) + eps
+        function_output = model.function_encoder(hidden[:, [-1], :])
+        mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
+        eps = torch.randn_like(mu) * 0.5
+        func_repr = mu + eps * log_sigma.exp()
         logits = model.function_decoder_mean(func_repr)
         probs = F.softmax(logits.squeeze(), dim=-1)
-        all_predictions.append(probs.cpu().numpy())
-    
+        all_predictions.append(probs.cpu().numpy())    
+        
     # Average predictions and find top tokens
     mean_probs = np.mean(all_predictions, axis=0)
     var_probs = np.var(all_predictions, axis=0)
