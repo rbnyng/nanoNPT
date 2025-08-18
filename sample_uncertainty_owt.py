@@ -374,8 +374,8 @@ def test_calibration_on_validation_data(n_samples=50):
             uncertainty = torch.var(logits_stack, dim=0).mean().item()
             
             mean_logits = torch.mean(logits_stack, dim=0)
-            error = F.cross_entropy(mean_logits.unsqueeze(0), torch.tensor([target], device=device)).item()
-            
+            target_tensor = torch.tensor([target], dtype=torch.long, device=device)
+            error = F.cross_entropy(mean_logits.unsqueeze(0), target_tensor).item()            
             uncertainties.append(uncertainty)
             errors.append(error)
             
