@@ -143,7 +143,10 @@ class GPT(nn.Module):
             
             # Project latent back to embedding space for conditioning
             if config.conditioning_method == 'film':
-                self.latent_to_film = nn.Linear(config.uncertainty_dim, 2 * config.n_embd)
+                nn.init.zeros_(self.latent_to_film.weight)
+                with torch.no_grad():
+                    self.latent_to_film.bias[:config.n_embd].fill_(1.0)
+                    self.latent_to_film.bias[config.n_embd:].zero_()
             else: # Default to 'add'
                 self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
                 
@@ -246,11 +249,12 @@ class GPT(nn.Module):
         # Standard VAE KL: KL(q(z|x) || p(z)) where p(z) = N(0,I)
         kl_per_dim = -0.5 * (1 + 2*log_sigma - mu.pow(2) - (2*log_sigma).exp())  # (B, latent_dim)
         
-        # Apply free bits: don't let KL go below threshold per dimension
+        # free-bits: subtract threshold, clamp below at 0
         if self.config.free_bits > 0:
-            kl_per_dim = torch.clamp(kl_per_dim, min=self.config.free_bits)
-        
-        # Sum over latent dimensions, mean over batch
+            kl_per_dim = torch.clamp(kl_per_dim - self.config.free_bits, min=0.0)
+            kl_loss = torch.sum(kl_per_dim, dim=-1).mean()     
+            
+        # sum over latent dimensions, mean over batch
         kl_loss = torch.sum(kl_per_dim, dim=-1).mean()  # Scalar
         return kl_loss
 
@@ -380,7 +384,7 @@ class GPT(nn.Module):
         # model surgery to decrease the block size if necessary
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size+1])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
