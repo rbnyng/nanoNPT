@@ -46,6 +46,8 @@ kl_weight_start = 0.0
 kl_weight_end = 0.1
 kl_anneal_steps = 10000
 kl_anneal_start = 1000
+kl_anneal_schedule = 'linear' # can be 'linear', 'cosine', or 'cyclical'
+kl_num_cycles = 4 # used only for cyclical schedule
 # adamw optimizer
 learning_rate = 6e-4
 max_iters = 600000
@@ -70,16 +72,42 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-def get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps):
-    """Get current KL weight based on annealing schedule"""
-    if iter_num < kl_anneal_start:
-        return kl_weight_start
-    elif iter_num >= kl_anneal_start + kl_anneal_steps:
-        return kl_weight_end
+def get_kl_weight(iter_num, config):
+    # Unpack configuration for clarity
+    start_weight = config.get('kl_weight_start', 0.0)
+    end_weight = config.get('kl_weight_end', 0.1)
+    anneal_start = config.get('kl_anneal_start', 0)
+    anneal_steps = config.get('kl_anneal_steps', 10000)
+    schedule = config.get('kl_anneal_schedule', 'linear')
+    num_cycles = config.get('kl_num_cycles', 4)
+
+    # Check if we are outside the annealing phase
+    if iter_num < anneal_start:
+        return start_weight
+    if iter_num >= anneal_start + anneal_steps:
+        return end_weight
+
+    # We are within the annealing phase, calculate progress
+    progress = (iter_num - anneal_start) / anneal_steps
+
+    if schedule == 'linear':
+        # Linear interpolation
+        return start_weight + progress * (end_weight - start_weight)
+    
+    elif schedule == 'cosine':
+        # Cosine interpolation
+        cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+        return start_weight + cosine_progress * (end_weight - start_weight)
+        
+    elif schedule == 'cyclical':
+        # Cyclical linear annealing
+        cycle_len = anneal_steps / num_cycles
+        current_pos_in_cycle = (iter_num - anneal_start) % cycle_len
+        cycle_progress = current_pos_in_cycle / cycle_len
+        return start_weight + cycle_progress * (end_weight - start_weight)
+        
     else:
-        # Linear annealing
-        progress = (iter_num - kl_anneal_start) / kl_anneal_steps
-        return kl_weight_start + progress * (kl_weight_end - kl_weight_start)
+        raise ValueError(f"Unknown KL annealing schedule: {schedule}")
         
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -239,7 +267,7 @@ def estimate_loss():
             X, Y = get_batch(split)
             with ctx:
                 logits, recon_loss, kl_loss = model(X, Y)
-                current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+                current_kl_weight = get_kl_weight(iter_num, config)
                 total_loss = recon_loss + current_kl_weight * kl_loss
                 
             total_losses[k] = total_loss.item()
@@ -295,7 +323,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+        current_kl_weight = get_kl_weight(iter_num, config)
         
         print(f"step {iter_num}: train loss {losses['train']['total']:.4f} (recon: {losses['train']['recon']:.4f}, kl: {losses['train']['kl']:.4f}), val loss {losses['val']['total']:.4f} (recon: {losses['val']['recon']:.4f}, kl: {losses['val']['kl']:.4f}), kl_weight: {current_kl_weight:.6f}", flush=True)
         
@@ -341,7 +369,7 @@ while True:
             logits, recon_loss, kl_loss = model(X, Y)
             
             # Get current KL weight
-            current_kl_weight = get_kl_weight(iter_num, kl_weight_start, kl_weight_end, kl_anneal_start, kl_anneal_steps)
+            current_kl_weight = get_kl_weight(iter_num, config)
             
             # Combine losses
             loss = recon_loss + current_kl_weight * kl_loss

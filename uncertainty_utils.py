@@ -28,35 +28,39 @@ def analyze_prompt_uncertainty(model, prompt, encode, decode, n_samples=30, verb
         if not ids:
             return None
 
-        # Ensure context is within model's block size
         if len(ids) > model.config.block_size:
             ids = ids[-model.config.block_size:]
         
         x = torch.tensor([ids], dtype=torch.long, device=device)
 
-        # Get transformer hidden states and context ONCE
-        hidden_states_with_cls = model.get_transformer_hidden(x)
-        global_context = model.aggregate_context(hidden_states_with_cls)
-        x_hidden = hidden_states_with_cls[:, 1:, :] # Strip CLS token for conditioning
+        # Run the expensive part of the model once to get the global context
+        # and the initial hidden state before the conditioned blocks.
+        global_context, initial_state = model.get_latent_context_and_intermediate_states(x)
 
-        # Sample multiple different global latents and get predictions
         sample_logits = []
         sample_entropies = []
         
         for _ in range(n_samples):
-            # Sample a different global latent each time
+            # a. Sample a different global latent each time
             z, _, _ = model.sample_global_latent(global_context, sample=True)
             
-            # Apply this specific latent via the configured conditioning method
-            if hasattr(model.config, 'conditioning_method') and model.config.conditioning_method == 'film':
-                film_params = model.latent_to_film(z).unsqueeze(1)
-                gamma, beta = film_params.chunk(2, dim=-1)
-                x_conditioned = gamma * x_hidden + beta
-            else: # Default to 'add'
-                z_emb = model.latent_to_emb(z).unsqueeze(1)
-                x_conditioned = x_hidden + z_emb
+            # b. Generate per-layer FiLM parameters
+            film_params = model.latent_to_film(z)
+            film_params = film_params.view(-1, model.config.n_layer, 2 * model.config.n_embd)
+            gammas, betas = film_params.chunk(2, dim=-1)
 
-            logits = model.lm_head(x_conditioned)
+            # c. Run the conditioned forward pass using the cached initial_state
+            conditioned_x = initial_state
+            for i, block in enumerate(model.transformer.h):
+                gamma_i = gammas[:, i, :].unsqueeze(1)
+                beta_i = betas[:, i, :].unsqueeze(1)
+                conditioned_x = block(conditioned_x, gamma_i, beta_i)
+            
+            conditioned_hidden = model.transformer.ln_f(conditioned_x)
+            
+            # d. Strip CLS and get logits
+            final_hidden = conditioned_hidden[:, 1:, :] # (B, T, C)
+            logits = model.lm_head(final_hidden)
             
             # Get last token prediction
             last_logits = logits[0, -1, :].float()
@@ -65,7 +69,7 @@ def analyze_prompt_uncertainty(model, prompt, encode, decode, n_samples=30, verb
             
             sample_logits.append(last_logits.cpu().numpy())
             sample_entropies.append(entropy.item())
-        
+            
         # Calculate uncertainty metrics
         logits_array = np.array(sample_logits)
         mean_logits = np.mean(logits_array, axis=0)

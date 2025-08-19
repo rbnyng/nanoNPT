@@ -91,11 +91,17 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, gamma=None, beta=None):
+        # Standard transformer block operations
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
 
+        # Apply FiLM conditioning if gamma and beta are provided
+        if gamma is not None and beta is not None:
+            x = gamma * x + beta
+            
+        return x
+        
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -123,6 +129,7 @@ class GPT(nn.Module):
         
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
         self.latent_to_film = nn.Linear(config.uncertainty_dim, 2 * config.n_embd)
+        
         # Standard transformer components
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -141,12 +148,19 @@ class GPT(nn.Module):
                 nn.Linear(config.n_embd // 2, 2 * config.uncertainty_dim)
             )
             
-            # Project latent back to embedding space for conditioning
+            # Project latent back for per-layer FiLM conditioning
             if config.conditioning_method == 'film':
+                # This single layer generates parameters for ALL transformer blocks
+                self.latent_to_film = nn.Linear(config.uncertainty_dim, config.n_layer * 2 * config.n_embd)
+                # Initialize to be an identity operation at the start of training
                 nn.init.zeros_(self.latent_to_film.weight)
                 with torch.no_grad():
-                    self.latent_to_film.bias[:config.n_embd].fill_(1.0)
-                    self.latent_to_film.bias[config.n_embd:].zero_()
+                    # Reshape bias to (n_layer, 2 * n_embd) for easier initialization
+                    bias = self.latent_to_film.bias.view(config.n_layer, 2 * config.n_embd)
+                    # Initialize all gammas to 1
+                    bias[:, :config.n_embd].fill_(1.0)
+                    # Initialize all betas to 0
+                    bias[:, config.n_embd:].zero_()
             else: # Default to 'add'
                 self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
                 
@@ -170,7 +184,7 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
+        
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -252,134 +266,123 @@ class GPT(nn.Module):
         return kl_loss
 
     def forward(self, idx, targets=None):
-        # Get transformer hidden states (includes CLS token at position 0)
-        hidden_states_with_cls = self.get_transformer_hidden(idx) # (B, T + 1, n_embd)
-        
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t + 1, dtype=torch.long, device=device) # t + 1 for CLS
+
+        # 1. Get initial embeddings
+        tok_emb = self.transformer.wte(idx)
+        cls_token_emb = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_token_emb, tok_emb), dim=1)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(x + pos_emb)
+
         if self.config.use_global_latent:
+            # 2. First, get the unconditioned hidden states to create the global context
+            # We pass through the blocks without FiLM (gamma=None, beta=None)
+            unconditioned_x = x
+            for block in self.transformer.h:
+                unconditioned_x = block(unconditioned_x)
+            unconditioned_hidden = self.transformer.ln_f(unconditioned_x)
+            
+            global_context = self.aggregate_context(unconditioned_hidden)
+            
+            # 3. Sample the latent variable z
             if targets is not None:
-                # Training: sample from global latent distribution
-                global_context = self.aggregate_context(hidden_states_with_cls)  # (B, n_embd)
                 z, mu, log_sigma = self.sample_global_latent(global_context, sample=True)
-                
-                # Strip the CLS token before conditioning and final projection
-                x = hidden_states_with_cls[:, 1:, :] # (B, T, n_embd)
-                
-                # Condition transformer output with global latent
-                if self.config.conditioning_method == 'film':
-                    film_params = self.latent_to_film(z).unsqueeze(1) # (B, 1, 2 * n_embd)
-                    gamma, beta = film_params.chunk(2, dim=-1) # Each is (B, 1, n_embd)
-                    x_conditioned = gamma * x + beta # Apply FiLM
-                else: # Default to 'add'
-                    z_emb = self.latent_to_emb(z).unsqueeze(1)
-                    x_conditioned = x + z_emb
-                    
-                # Standard language modeling
-                logits = self.lm_head(x_conditioned)
-                
-                # Compute losses
+            else: # Inference
+                z, mu, log_sigma = self.sample_global_latent(global_context, sample=False)
+
+            # 4. Generate per-layer FiLM parameters from z
+            film_params = self.latent_to_film(z) # Shape: (B, L * 2C)
+            film_params = film_params.view(-1, self.config.n_layer, 2 * self.config.n_embd) # (B, L, 2C)
+            gammas, betas = film_params.chunk(2, dim=-1) # Each is (B, L, C)
+
+            # 5. Run the main, conditioned forward pass
+            conditioned_x = x
+            for i, block in enumerate(self.transformer.h):
+                gamma_i = gammas[:, i, :].unsqueeze(1) # (B, 1, C) for broadcasting over T
+                beta_i = betas[:, i, :].unsqueeze(1)
+                conditioned_x = block(conditioned_x, gamma_i, beta_i)
+            
+            conditioned_hidden = self.transformer.ln_f(conditioned_x)
+            
+            # Strip the CLS token and get logits
+            final_hidden = conditioned_hidden[:, 1:, :]
+            logits = self.lm_head(final_hidden)
+            
+            if targets is not None:
                 recon_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
                 kl_loss = self.compute_kl_loss(mu, log_sigma)
-                
                 return logits, recon_loss, kl_loss
             else:
-                # Inference: use mean latent (deterministic)
-                global_context = self.aggregate_context(hidden_states_with_cls)
-                z, _, _ = self.sample_global_latent(global_context, sample=False)
-                
-                # Strip the CLS token
-                x = hidden_states_with_cls[:, 1:, :] # (B, T, n_embd)
-                
-                if self.config.conditioning_method == 'film':
-                    film_params = self.latent_to_film(z).unsqueeze(1)  # (B, 1, 2*n_embd)
-                    gamma, beta = film_params.chunk(2, dim=-1)         # (B, 1, n_embd)
-                    x_conditioned = gamma * x + beta
-                else:  # 'add'
-                    z_emb = self.latent_to_emb(z).unsqueeze(1)         # (B, 1, n_embd)
-                    x_conditioned = x + z_emb
-                    
-                logits = self.lm_head(x_conditioned)
-                
                 return logits, None, None
-        else:
-            # Fallback to old per-token system for comparison
-            if targets is not None:
-                function_output = self.function_encoder(x)
-                mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
-                eps = torch.randn_like(mu)
-                function_sample = mu + eps * log_sigma.exp()
-                logits = self.function_decoder_mean(function_sample)
                 
-                recon_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
-                kl_loss = self.compute_kl_loss(mu.view(-1, mu.size(-1)), log_sigma.view(-1, log_sigma.size(-1)))
-                
-                return logits, recon_loss, kl_loss
-            else:
-                function_output = self.function_encoder(x[:, [-1], :])
-                mu, _ = torch.chunk(function_output, 2, dim=-1)
-                logits = self.function_decoder_mean(mu)
-                return logits, None, None
-
     @torch.no_grad()
     def generate_with_uncertainty(self, idx, max_new_tokens, temperature=1.0, top_k=None, n_samples=1):
-        """
-        Generate with uncertainty sampling using different global latents per sample
-        """
+        self.eval()
         samples = []
         
         for _ in range(n_samples):
             current_idx = idx.clone()
             
-            # Sample a global latent once for this entire sequence
+            # --- Sample a global latent once for this entire sequence ---
             if self.config.use_global_latent:
-                # Get initial context and sample latent
-                x_init = self.get_transformer_hidden(current_idx)
-                global_context = self.aggregate_context(x_init)
+                # Get the unconditioned hidden states to create the global context
+                unconditioned_hidden = self.get_transformer_hidden(current_idx)
+                global_context = self.aggregate_context(unconditioned_hidden)
+                
+                # Sample a single z and generate all FiLM parameters for it
                 z_fixed, _, _ = self.sample_global_latent(global_context, sample=True)
+                film_params = self.latent_to_film(z_fixed)
+                film_params = film_params.view(-1, self.config.n_layer, 2 * self.config.n_embd)
+                gammas, betas = film_params.chunk(2, dim=-1) # Each is (B, L, C)
             
+            # --- Autoregressive generation loop ---
             for _ in range(max_new_tokens):
-                # if the sequence context is growing too long we must crop it at block_size
+                # Crop context if it's getting too long
                 idx_cond = current_idx if current_idx.size(1) <= self.config.block_size else current_idx[:, -self.config.block_size:]
                 
-                # forward the model to get the logits for the index in the sequence
-                hidden_states_with_cls = self.get_transformer_hidden(idx_cond)
-                x = hidden_states_with_cls[:, 1:, :]  # strip CLS, consistent with forward()              
+                # Get initial embeddings for the current context
+                device = idx_cond.device
+                b, t = idx_cond.size()
+                pos = torch.arange(0, t, dtype=torch.long, device=device)
+                tok_emb = self.transformer.wte(idx_cond)
+                pos_emb = self.transformer.wpe(pos)
+                x = self.transformer.drop(tok_emb + pos_emb)
+
+                # Forward the model using the fixed FiLM parameters at each block
+                for i, block in enumerate(self.transformer.h):
+                    gamma_i = gammas[:, i, :].unsqueeze(1) # (B, 1, C)
+                    beta_i = betas[:, i, :].unsqueeze(1)
+                    x = block(x, gamma_i, beta_i)
                 
-                if self.config.use_global_latent:
-                    # Use the fixed global latent for entire sequence
-                    if hasattr(self.config, 'conditioning_method') and self.config.conditioning_method == 'film':
-                        film_params = self.latent_to_film(z_fixed).unsqueeze(1)
-                        gamma, beta = film_params.chunk(2, dim=-1)
-                        x_conditioned = gamma * x + beta
-                    else: # Default to 'add'
-                        z_emb = self.latent_to_emb(z_fixed).unsqueeze(1)
-                        x_conditioned = x + z_emb                    
-                    logits = self.lm_head(x_conditioned)
-                else:
-                    # Fallback per-token sampling
-                    function_output = self.function_encoder(x[:, [-1], :])
-                    mu, log_sigma = torch.chunk(function_output, 2, dim=-1)
-                    eps = torch.randn_like(mu)
-                    function_sample = mu + eps * log_sigma.exp()
-                    logits = self.function_decoder_mean(function_sample)
+                x = self.transformer.ln_f(x)
+                logits = self.lm_head(x)
                 
-                # pluck the logits at the final step and scale by desired temperature
+                # Pluck the logits at the final step and scale by temperature
                 logits = logits[:, -1, :] / temperature
-                # optionally crop the logits to only the top k options
+                
+                # Optionally crop the logits to only the top k options
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
-                # apply softmax to convert logits to (normalized) probabilities
+                    
+                # Apply softmax to get probabilities
                 probs = F.softmax(logits, dim=-1)
-                # sample from the distribution
+                
+                # Sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1)
-                # append sampled index to the running sequence and continue
+                
+                # Append to the sequence and continue
                 current_idx = torch.cat((current_idx, idx_next), dim=1)
 
             samples.append(current_idx)
         
+        self.train()
         return samples
-
-    # Keep all the other methods from original (crop_block_size, from_pretrained, etc.)
+        
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         assert block_size <= self.config.block_size
@@ -453,3 +456,29 @@ class GPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+        
+    @torch.no_grad()
+    def get_latent_context_and_intermediate_states(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Sequence length {t} exceeds block size {self.config.block_size}"
+        pos = torch.arange(0, t + 1, dtype=torch.long, device=device)
+
+        # Get initial embeddings
+        tok_emb = self.transformer.wte(idx)
+        cls_token_emb = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_token_emb, tok_emb), dim=1)
+        pos_emb = self.transformer.wpe(pos)
+        
+        # This is the initial state that will be fed into the conditioned blocks
+        initial_state = self.transformer.drop(x + pos_emb)
+
+        # Run the unconditioned pass to get the global context
+        unconditioned_x = initial_state
+        for block in self.transformer.h:
+            unconditioned_x = block(unconditioned_x) # No FiLM params
+        unconditioned_hidden = self.transformer.ln_f(unconditioned_x)
+        
+        global_context = self.aggregate_context(unconditioned_hidden)
+
+        return global_context, initial_state
