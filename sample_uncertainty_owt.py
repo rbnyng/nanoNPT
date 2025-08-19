@@ -284,7 +284,7 @@ def run_category_analysis():
         category_results = []
         
         for prompt in prompts:
-            result = analyze_prompt_uncertainty(model, encode, decode, n_samples=20, verbose=False)
+            result = analyze_prompt_uncertainty(model, prompt, encode, decode, n_samples=20, verbose=False)
             if result:
                 category_results.append(result)
                 print(f"'{prompt[:40]:40s}' → {result['logit_variance']:.6f}")
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     sample_with_uncertainty(model, "In my opinion,", encode, decode, max_new_tokens=30, n_samples=3)
     
     # Global latent comparison
-    compare_global_latents(model, "The future of artificial intelligence", encode, decode, n_samples=4, max_tokens=25)
+    compare_latent_effects(model, "The future of artificial intelligence", encode, decode, n_samples=4, max_tokens=25)
     
     # Detailed analysis of examples
     print("\n" + "="*80)
