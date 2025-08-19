@@ -113,154 +113,6 @@ LONG_CONTEXTS = [
     "According to multiple independent sources and verified reports from experts,",
 ]
 
-# ============================================================================
-# ANALYSIS FUNCTIONS  
-# ============================================================================
-
-# @torch.no_grad()
-# def analyze_prompt_uncertainty(model, prompt, n_samples=30, verbose=False):
-    # try:
-        # ids = encode(prompt)
-        # if len(ids) == 0:
-            # return None
-        
-        # # Limit context length
-        # if len(ids) > model.config.block_size:
-            # ids = ids[-model.config.block_size:]
-            
-        # x = torch.tensor([ids], dtype=torch.long, device=device)
-        
-        # # Get transformer hidden states ONCE
-        # x_hidden = model.get_transformer_hidden(x)
-        # global_context = model.aggregate_context(x_hidden)
-        
-        # # Sample multiple DIFFERENT global latents and see their effects
-        # sample_logits = []
-        # sample_entropies = []
-        
-        # for _ in range(n_samples):
-            # with ctx:
-                # # Sample a different global latent each time
-                # z, mu, log_sigma = model.sample_global_latent(global_context, sample=True)
-                
-                # # Apply this specific latent
-                # z_emb = model.latent_to_emb(z).unsqueeze(1)
-                # x_conditioned = x_hidden + z_emb
-                # logits = model.lm_head(x_conditioned)
-                
-                # # Get last token prediction
-                # last_logits = logits[0, -1, :].float()
-                # probs = F.softmax(last_logits, dim=-1)
-                # entropy = -torch.sum(probs * torch.log(probs + 1e-8))
-                
-                # sample_logits.append(last_logits.cpu().numpy())
-                # sample_entropies.append(entropy.item())
-        
-        # # Calculate uncertainty metrics
-        # logits_array = np.array(sample_logits)
-        # mean_logits = np.mean(logits_array, axis=0)
-        # var_logits = np.var(logits_array, axis=0)
-        
-        # # Overall metrics
-        # total_variance = np.mean(var_logits)
-        # mean_entropy = np.mean(sample_entropies)
-        # std_entropy = np.std(sample_entropies)
-        
-        # # Top predicted tokens
-        # mean_probs = F.softmax(torch.tensor(mean_logits).float(), dim=-1).numpy()
-        # top_indices = np.argsort(mean_probs)[-5:][::-1]
-        
-        # if verbose:
-            # print(f"\n--- Analyzing: '{prompt}' ---")
-            # print(f"Logit variance: {total_variance:.6f}")
-            # print(f"Entropy: {mean_entropy:.3f} ± {std_entropy:.3f}")
-            # print("Top predictions:")
-            # for i, idx in enumerate(top_indices):
-                # token = decode([idx])
-                # prob = mean_probs[idx]
-                # var_prob = var_logits[idx]
-                # print(f"  {i+1}. '{token}' → prob: {prob:.3f}, var: {var_prob:.6f}")
-        
-        # return {
-            # 'prompt': prompt,
-            # 'logit_variance': total_variance,
-            # 'entropy_mean': mean_entropy,
-            # 'entropy_std': std_entropy,
-            # 'top_tokens': [(decode([idx]), mean_probs[idx], var_logits[idx]) for idx in top_indices],
-            # 'n_samples': n_samples
-        # }
-        
-    # except Exception as e:
-        # print(f"Error analyzing '{prompt}': {e}")
-        # return None
-
-# @torch.no_grad()
-# def sample_with_uncertainty(model, prompt, max_new_tokens=50, n_samples=5, temperature=0.8):
-    # print(f"\n=== UNCERTAINTY SAMPLING: '{prompt}' ===")
-    
-    # try:
-        # ids = encode(prompt)
-        # if len(ids) == 0:
-            # print("Empty prompt!")
-            # return
-        
-        # if len(ids) > model.config.block_size:
-            # ids = ids[-model.config.block_size:]
-        
-        # samples = model.generate_with_uncertainty(
-            # torch.tensor([ids], dtype=torch.long, device=device),
-            # max_new_tokens=max_new_tokens,
-            # temperature=temperature,
-            # n_samples=n_samples
-        # )
-        
-        # for i, sample in enumerate(samples):
-            # sample_text = decode(sample[0].tolist())
-            # print(f"\n--- Sample {i+1} ---")
-            # print(sample_text)
-            # print("---")
-            
-    # except Exception as e:
-        # print(f"Error sampling '{prompt}': {e}")
-
-# @torch.no_grad()
-# def compare_global_latents(model, prompt, n_samples=4, max_tokens=30):
-    # print(f"\n=== GLOBAL LATENT COMPARISON: '{prompt}' ===")
-    
-    # try:
-        # ids = encode(prompt)
-        # if len(ids) > model.config.block_size:
-            # ids = ids[-model.config.block_size:]
-        # x = torch.tensor([ids], dtype=torch.long, device=device)
-        
-        # # Generate with different global latents
-        # for i in range(n_samples):
-            # with ctx:
-                # # Get fresh global latent by doing a forward pass
-                # x_hidden = model.get_transformer_hidden(x)
-                # global_context = model.aggregate_context(x_hidden)
-                # z, _, _ = model.sample_global_latent(global_context, sample=True)
-                
-                # # Generate with this fixed latent
-                # current_tokens = x.clone()
-                # for _ in range(max_tokens):
-                    # if current_tokens.size(1) > model.config.block_size:
-                        # current_tokens = current_tokens[:, -model.config.block_size:]
-                    
-                    # x_hidden = model.get_transformer_hidden(current_tokens)
-                    # z_emb = model.latent_to_emb(z).unsqueeze(1)
-                    # x_conditioned = x_hidden + z_emb
-                    # logits = model.lm_head(x_conditioned)
-                    
-                    # probs = F.softmax(logits[:, -1, :] / 0.8, dim=-1)
-                    # next_token = torch.multinomial(probs, num_samples=1)
-                    # current_tokens = torch.cat([current_tokens, next_token], dim=1)
-                
-                # print(f"\nLatent {i+1}: {decode(current_tokens[0].tolist())}")
-                
-    # except Exception as e:
-        # print(f"Error in latent comparison '{prompt}': {e}")
-
 @torch.no_grad()
 def run_category_analysis():
     print("\n" + "="*80)
@@ -330,7 +182,7 @@ def test_context_length_effects():
     return results
 
 @torch.no_grad()
-def test_calibration_on_validation_data(n_samples=50):
+def test_calibration_on_validation_data(model, n_samples=30):
     print(f"\n=== VALIDATION DATA CALIBRATION ===")
     
     uncertainties = []
@@ -338,40 +190,43 @@ def test_calibration_on_validation_data(n_samples=50):
     
     for i in range(n_samples):
         try:
-            # Random sequence from validation
+            # Get a random sequence from the validation data
             start_idx = np.random.randint(0, len(val_data) - model.config.block_size - 2)
             context_len = min(100, model.config.block_size - 1)
             
             context = val_data[start_idx : start_idx + context_len]
             target = val_data[start_idx + context_len]
             
-            x = torch.tensor([context], dtype=torch.long, device=device)
+            x = torch.tensor([context], dtype=torch.long, device=model.parameters().__next__().device)
             
-            # Get transformer hidden states and context
-            h_cls = model.get_transformer_hidden(x)
-            global_context = model.aggregate_context(h_cls)
-            h = h_cls[:, 1:, :] # Strip CLS token for conditioning
-            
+            global_context, initial_state = model.get_latent_context_and_intermediate_states(x)
+
+            # Loop through the cheap sampling part
             sample_logits = []
-            for _ in range(10):
+            for _ in range(10): # Number of latents to sample per validation item
                 z, _, _ = model.sample_global_latent(global_context, sample=True)
                 
-                if hasattr(model.config, 'conditioning_method') and model.config.conditioning_method == 'film':
-                    film_params = model.latent_to_film(z).unsqueeze(1)
-                    gamma, beta = film_params.chunk(2, dim=-1)
-                    h_conditioned = gamma * h + beta
-                else:
-                    z_emb = model.latent_to_emb(z).unsqueeze(1)
-                    h_conditioned = h + z_emb
+                film_params = model.latent_to_film(z)
+                film_params = film_params.view(-1, model.config.n_layer, 2 * model.config.n_embd)
+                gammas, betas = film_params.chunk(2, dim=-1)
+
+                conditioned_x = initial_state
+                for j, block in enumerate(model.transformer.h):
+                    gamma_j = gammas[:, j, :].unsqueeze(1)
+                    beta_j = betas[:, j, :].unsqueeze(1)
+                    conditioned_x = block(conditioned_x, gamma_j, beta_j)
                 
-                logits = model.lm_head(h_conditioned)
+                conditioned_hidden = model.transformer.ln_f(conditioned_x)
+                
+                final_hidden = conditioned_hidden[:, 1:, :]
+                logits = model.lm_head(final_hidden)
                 sample_logits.append(logits[0, -1, :])
             
             logits_stack = torch.stack(sample_logits)
             uncertainty = torch.var(logits_stack, dim=0).mean().item()
             
             mean_logits = torch.mean(logits_stack, dim=0)
-            target_tensor = torch.tensor([target], dtype=torch.long, device=device)
+            target_tensor = torch.tensor([target], dtype=torch.long, device=model.parameters().__next__().device)
             error = F.cross_entropy(mean_logits.unsqueeze(0), target_tensor).item()
             
             uncertainties.append(uncertainty)
@@ -392,7 +247,7 @@ def test_calibration_on_validation_data(n_samples=50):
         print(f"\nCorrelation between uncertainty and prediction error: {correlation:.3f}")
     
     return uncertainties, errors
-
+    
 if __name__ == "__main__":
     print("OPENWEBTEXT NEURAL PROCESS UNCERTAINTY ANALYSIS")
     print("="*80)
@@ -427,7 +282,7 @@ if __name__ == "__main__":
     length_results = test_context_length_effects()
     
     # Validation calibration
-    uncertainties, errors = test_calibration_on_validation_data(n_samples=30)
+    uncertainties, errors = test_calibration_on_validation_data(model, n_samples=30)
     
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE")
