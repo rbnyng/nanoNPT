@@ -122,7 +122,7 @@ class GPT(nn.Module):
         self.config = config
         
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
-        
+        self.latent_to_film = nn.Linear(config.uncertainty_dim, 2 * config.n_embd)
         # Standard transformer components
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -150,12 +150,6 @@ class GPT(nn.Module):
             else: # Default to 'add'
                 self.latent_to_emb = nn.Linear(config.uncertainty_dim, config.n_embd)
                 
-            # Optionally use attention for context aggregation
-            if config.context_aggregation == 'attention':
-                self.context_attention = nn.MultiheadAttention(
-                    config.n_embd, num_heads=config.n_head, 
-                    dropout=config.dropout, batch_first=True
-                )
         else:
             # Fallback to old per-token system (for comparison)
             self.function_encoder = nn.Linear(config.n_embd, 2 * config.uncertainty_dim)
@@ -252,10 +246,9 @@ class GPT(nn.Module):
         # free-bits: subtract threshold, clamp below at 0
         if self.config.free_bits > 0:
             kl_per_dim = torch.clamp(kl_per_dim - self.config.free_bits, min=0.0)
-            kl_loss = torch.sum(kl_per_dim, dim=-1).mean()     
-            
         # sum over latent dimensions, mean over batch
-        kl_loss = torch.sum(kl_per_dim, dim=-1).mean()  # Scalar
+        kl_loss = torch.sum(kl_per_dim, dim=-1).mean()
+        
         return kl_loss
 
     def forward(self, idx, targets=None):
@@ -296,8 +289,14 @@ class GPT(nn.Module):
                 # Strip the CLS token
                 x = hidden_states_with_cls[:, 1:, :] # (B, T, n_embd)
                 
-                z_emb = self.latent_to_emb(z).unsqueeze(1)
-                x_conditioned = x + z_emb
+                if self.config.conditioning_method == 'film':
+                    film_params = self.latent_to_film(z).unsqueeze(1)  # (B, 1, 2*n_embd)
+                    gamma, beta = film_params.chunk(2, dim=-1)         # (B, 1, n_embd)
+                    x_conditioned = gamma * x + beta
+                else:  # 'add'
+                    z_emb = self.latent_to_emb(z).unsqueeze(1)         # (B, 1, n_embd)
+                    x_conditioned = x + z_emb
+                    
                 logits = self.lm_head(x_conditioned)
                 
                 return logits, None, None
@@ -342,7 +341,8 @@ class GPT(nn.Module):
                 idx_cond = current_idx if current_idx.size(1) <= self.config.block_size else current_idx[:, -self.config.block_size:]
                 
                 # forward the model to get the logits for the index in the sequence
-                x = self.get_transformer_hidden(idx_cond)
+                hidden_states_with_cls = self.get_transformer_hidden(idx_cond)
+                x = hidden_states_with_cls[:, 1:, :]  # strip CLS, consistent with forward()              
                 
                 if self.config.use_global_latent:
                     # Use the fixed global latent for entire sequence
